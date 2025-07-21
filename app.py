@@ -12,23 +12,47 @@ import time
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
 
-# Available models from Hugging Face API
+# Available models from Hugging Face API - Updated with working models
 AVAILABLE_MODELS = {
-    "Mistral-7B-Instruct": {
-        "model_name": "mistralai/Mistral-7B-Instruct-v0.1",
-        "description": "High-quality instruction-following model"
+    "Microsoft DialoGPT": {
+        "model_name": "microsoft/DialoGPT-medium",
+        "description": "Conversational AI model good for structured text"
     },
-    "Llama-2-7B-Chat": {
-        "model_name": "meta-llama/Llama-2-7b-chat-hf",
-        "description": "Meta's conversational AI model"
+    "Google Flan-T5": {
+        "model_name": "google/flan-t5-base",
+        "description": "Text-to-text model excellent for professional writing"
     },
-    "CodeLlama-7B-Instruct": {
-        "model_name": "codellama/CodeLlama-7b-Instruct-hf",
-        "description": "Code and instruction optimized model"
+    "Salesforce BLIP": {
+        "model_name": "Salesforce/blip-image-captioning-base",
+        "description": "Multi-modal model (fallback to text generation)"
     },
-    "Zephyr-7B-Beta": {
-        "model_name": "HuggingFaceH4/zephyr-7b-beta",
-        "description": "Fine-tuned for helpful responses"
+    "GPT-2": {
+        "model_name": "gpt2",
+        "description": "Classic generative model for text completion"
+    },
+    "DistilBERT": {
+        "model_name": "distilbert-base-uncased",
+        "description": "Efficient transformer for text processing"
+    }
+}
+
+# Alternative: Use text-generation models that are more likely to work
+WORKING_MODELS = {
+    "GPT-2": {
+        "model_name": "gpt2",
+        "description": "OpenAI's GPT-2 model for text generation"
+    },
+    "DistilGPT-2": {
+        "model_name": "distilgpt2",
+        "description": "Smaller, faster version of GPT-2"
+    },
+    "GPT-2 Large": {
+        "model_name": "gpt2-large",
+        "description": "Larger version of GPT-2 for better quality"
+    },
+    "T5-Small": {
+        "model_name": "t5-small",
+        "description": "Google's T5 model for text-to-text generation"
     }
 }
 
@@ -93,6 +117,25 @@ class HuggingFaceAPI:
             "Authorization": f"Bearer {self.api_key}" if self.api_key else None
         }
     
+    def test_model_availability(self, model_name: str) -> bool:
+        """Test if a model is available"""
+        if not self.api_key:
+            return False
+        
+        url = f"{self.base_url}{model_name}"
+        
+        try:
+            response = requests.post(
+                url, 
+                headers=self.headers, 
+                json={"inputs": "test"},
+                timeout=10
+            )
+            # Model is available if we get any response (even if it's loading)
+            return response.status_code in [200, 503]
+        except:
+            return False
+    
     def query_model(self, model_name: str, prompt: str, max_length: int = 512) -> str:
         """Query Hugging Face model via API"""
         if not self.api_key:
@@ -100,50 +143,79 @@ class HuggingFaceAPI:
         
         url = f"{self.base_url}{model_name}"
         
-        # Prepare payload based on model type
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": max_length,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "do_sample": True,
-                "return_full_text": False
+        # Different payload structures for different model types
+        if "t5" in model_name.lower():
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "max_length": max_length,
+                    "temperature": 0.7,
+                    "do_sample": True
+                }
             }
-        }
+        else:
+            # For GPT-2 and similar models
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": min(max_length, 250),  # Reduced for better API compatibility
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "do_sample": True,
+                    "return_full_text": False
+                }
+            }
         
         try:
             response = requests.post(
                 url, 
                 headers=self.headers, 
                 json=payload,
-                timeout=30
+                timeout=60  # Increased timeout
             )
             
             if response.status_code == 503:
                 # Model is loading, wait and retry
+                print("Model is loading, waiting 20 seconds...")
                 time.sleep(20)
                 response = requests.post(
                     url, 
                     headers=self.headers, 
                     json=payload,
-                    timeout=30
+                    timeout=60
                 )
+            
+            if response.status_code == 404:
+                return f"Error: Model '{model_name}' not found. Please try a different model."
             
             response.raise_for_status()
             result = response.json()
             
             if isinstance(result, list) and len(result) > 0:
                 if "generated_text" in result[0]:
-                    return result[0]["generated_text"]
+                    generated = result[0]["generated_text"]
+                    # Clean up the generated text
+                    if generated.startswith(prompt):
+                        generated = generated[len(prompt):].strip()
+                    return generated
                 else:
                     return str(result[0])
+            elif isinstance(result, dict):
+                if "generated_text" in result:
+                    generated = result["generated_text"]
+                    if generated.startswith(prompt):
+                        generated = generated[len(prompt):].strip()
+                    return generated
+                else:
+                    return str(result)
             else:
                 return str(result)
                 
         except requests.exceptions.Timeout:
-            return "Error: Request timed out. Please try again."
+            return "Error: Request timed out. The model might be overloaded. Please try again later."
         except requests.exceptions.RequestException as e:
+            if "404" in str(e):
+                return f"Error: Model '{model_name}' is not available via the API. Please try a different model."
             return f"Error: API request failed - {str(e)}"
         except Exception as e:
             return f"Error: {str(e)}"
@@ -157,7 +229,7 @@ class ResumeBuilderApp:
         """Build optimized resume prompt"""
         target_section = f"\nTarget Role: {target_role}" if target_role else ""
         
-        return f"""Create a professional {language} resume for the following person:
+        return f"""Write a professional {language} resume for:
 
 Name: {name}
 Education: {education}
@@ -165,36 +237,26 @@ Experience: {experience}
 Skills: {skills}
 Job Category: {job_category}{target_section}
 
-Please generate a well-structured resume with the following sections:
-1. Professional Summary (2-3 sentences)
-2. Skills
-3. Work Experience (with achievements)
-4. Education
+Create a structured resume with these sections:
 
-Make it professional and tailored to the job category. Format it clearly with proper sections.
-
-Resume:"""
+PROFESSIONAL SUMMARY:
+"""
 
     def build_cover_letter_prompt(self, name, education, experience, skills, job_category, language, company_name=None):
         """Build optimized cover letter prompt"""
-        company_section = f"\nCompany: {company_name}" if company_name else ""
+        company_section = f" for {company_name}" if company_name else ""
         
-        return f"""Write a professional {language} cover letter for:
+        return f"""Write a professional {language} cover letter{company_section}:
 
-Name: {name}
+Applicant: {name}
 Education: {education}
 Experience: {experience}
 Skills: {skills}
-Job Category: {job_category}{company_section}
+Job Category: {job_category}
 
-Create a compelling cover letter with:
-1. Professional opening paragraph
-2. Body highlighting relevant experience and skills
-3. Strong closing paragraph
+Dear Hiring Manager,
 
-Make it engaging and tailored to the job category.
-
-Cover Letter:"""
+"""
 
     def generate_resume(self, name, education, experience, skills, job_category, 
                        language, model_name, target_role, progress=gr.Progress()):
@@ -211,8 +273,9 @@ Cover Letter:"""
         
         progress(0.5, desc="Generating resume with AI...")
         
-        model_info = AVAILABLE_MODELS.get(model_name, AVAILABLE_MODELS["Zephyr-7B-Beta"])
-        result = self.hf_api.query_model(model_info["model_name"], prompt, max_length=600)
+        # Use WORKING_MODELS instead of AVAILABLE_MODELS
+        model_info = WORKING_MODELS.get(model_name, WORKING_MODELS["GPT-2"])
+        result = self.hf_api.query_model(model_info["model_name"], prompt, max_length=400)
         
         if result.startswith("Error"):
             progress(1.0, desc="Error occurred")
@@ -220,22 +283,38 @@ Cover Letter:"""
         
         progress(0.8, desc="Creating PDF...")
         
-        # Clean up the result
+        # Clean up the result and add structure
         clean_result = result.strip()
         if not clean_result:
-            return "❌ Generated content is empty. Please try again.", None
+            return "❌ Generated content is empty. Please try again with a different model.", None
+        
+        # Add basic structure to the result
+        formatted_resume = f"""RESUME - {name.upper()}
+
+PROFESSIONAL SUMMARY:
+{clean_result}
+
+EDUCATION:
+{education}
+
+SKILLS:
+{skills}
+
+WORK EXPERIENCE:
+{experience}
+"""
         
         # Generate PDF
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         pdf_filename = f"resume_{name.replace(' ', '_').replace('/', '_')}_{timestamp}.pdf"
-        pdf_path = self.pdf_generator.create_pdf(clean_result, f"Resume - {name}", pdf_filename)
+        pdf_path = self.pdf_generator.create_pdf(formatted_resume, f"Resume - {name}", pdf_filename)
         
         progress(1.0, desc="Complete!")
         
         if pdf_path:
-            return f"✅ **Resume Generated Successfully**\n\n{clean_result}", pdf_path
+            return f"✅ **Resume Generated Successfully**\n\n{formatted_resume}", pdf_path
         else:
-            return f"✅ **Resume Generated Successfully** (PDF creation failed)\n\n{clean_result}", None
+            return f"✅ **Resume Generated Successfully** (PDF creation failed)\n\n{formatted_resume}", None
 
     def generate_cover_letter(self, name, education, experience, skills, job_category,
                              language, model_name, company_name, progress=gr.Progress()):
@@ -252,8 +331,9 @@ Cover Letter:"""
         
         progress(0.5, desc="Generating cover letter with AI...")
         
-        model_info = AVAILABLE_MODELS.get(model_name, AVAILABLE_MODELS["Zephyr-7B-Beta"])
-        result = self.hf_api.query_model(model_info["model_name"], prompt, max_length=500)
+        # Use WORKING_MODELS instead of AVAILABLE_MODELS
+        model_info = WORKING_MODELS.get(model_name, WORKING_MODELS["GPT-2"])
+        result = self.hf_api.query_model(model_info["model_name"], prompt, max_length=300)
         
         if result.startswith("Error"):
             progress(1.0, desc="Error occurred")
@@ -261,22 +341,39 @@ Cover Letter:"""
         
         progress(0.8, desc="Creating PDF...")
         
-        # Clean up the result
+        # Clean up the result and format as cover letter
         clean_result = result.strip()
         if not clean_result:
-            return "❌ Generated content is empty. Please try again.", None
+            return "❌ Generated content is empty. Please try again with a different model.", None
+        
+        company_text = company_name if company_name else "Your Company"
+        
+        formatted_letter = f"""COVER LETTER
+
+{name}
+Date: {datetime.now().strftime("%B %d, %Y")}
+
+Dear Hiring Manager,
+
+{clean_result}
+
+Thank you for considering my application. I look forward to hearing from you.
+
+Sincerely,
+{name}
+"""
         
         # Generate PDF
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         pdf_filename = f"cover_letter_{name.replace(' ', '_').replace('/', '_')}_{timestamp}.pdf"
-        pdf_path = self.pdf_generator.create_pdf(clean_result, f"Cover Letter - {name}", pdf_filename)
+        pdf_path = self.pdf_generator.create_pdf(formatted_letter, f"Cover Letter - {name}", pdf_filename)
         
         progress(1.0, desc="Complete!")
         
         if pdf_path:
-            return f"✅ **Cover Letter Generated Successfully**\n\n{clean_result}", pdf_path
+            return f"✅ **Cover Letter Generated Successfully**\n\n{formatted_letter}", pdf_path
         else:
-            return f"✅ **Cover Letter Generated Successfully** (PDF creation failed)\n\n{clean_result}", None
+            return f"✅ **Cover Letter Generated Successfully** (PDF creation failed)\n\n{formatted_letter}", None
 
     def create_interface(self):
         """Create Gradio interface"""
@@ -306,6 +403,13 @@ Cover Letter:"""
             padding: 1rem;
             margin: 1rem 0;
         }
+        .warning-box {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
         """
         
         with gr.Blocks(css=custom_css, title="AI Resume & Cover Letter Builder", theme=gr.themes.Soft()) as interface:
@@ -313,7 +417,7 @@ Cover Letter:"""
             gr.HTML("""
             <div class="main-header">
                 <h1>🚀 AI Resume & Cover Letter Builder</h1>
-                <p>Create professional resumes and cover letters with advanced AI models</p>
+                <p>Create professional resumes and cover letters with AI models</p>
             </div>
             """)
             
@@ -326,23 +430,31 @@ Cover Letter:"""
             </div>
             """)
             
+            # Warning about models
+            gr.HTML("""
+            <div class="warning-box">
+                <strong>⚠️ Note:</strong> This version uses basic GPT-2 models which are more reliable but may produce shorter text. 
+                For better results, consider using local models or paid APIs like OpenAI.
+            </div>
+            """)
+            
             with gr.Row():
                 with gr.Column():
                     gr.HTML('<div class="section-header">🤖 AI Model Selection</div>')
                     model_dropdown = gr.Dropdown(
-                        choices=list(AVAILABLE_MODELS.keys()),
-                        value="Zephyr-7B-Beta",
+                        choices=list(WORKING_MODELS.keys()),
+                        value="GPT-2",
                         label="AI Model",
                         info="Select the AI model for document generation"
                     )
                     
                     # Display model info
                     def update_model_info(model_name):
-                        return AVAILABLE_MODELS[model_name]["description"]
+                        return WORKING_MODELS[model_name]["description"]
                     
                     model_info = gr.Textbox(
                         label="Model Description",
-                        value=AVAILABLE_MODELS["Zephyr-7B-Beta"]["description"],
+                        value=WORKING_MODELS["GPT-2"]["description"],
                         interactive=False
                     )
                     
@@ -441,7 +553,7 @@ Cover Letter:"""
                         "Digital Marketing, SEO/SEM, Content Creation, Google Analytics, Social Media Management, Project Management, Adobe Creative Suite",
                         "Digital Marketing", 
                         "English", 
-                        "Zephyr-7B-Beta", 
+                        "GPT-2", 
                         "Senior Marketing Manager"
                     ]
                 ],
