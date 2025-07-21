@@ -1,5 +1,4 @@
-torch>=1.13.0
-transformers>=4.25.0
 gradio>=4.0.0
-fpdf2>=3.0.0
-accelerate>=0.20.0
+requests>=2.25.0
+fpdf2>=2.7.0
+python-multipart>=0.0.6
