@@ -1,45 +1,34 @@
 import gradio as gr
-import torch
-from transformers import (
-    AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM,
-    GenerationConfig
-)
+import requests
+import json
 import warnings
 from typing import Optional, Dict, Any
-import gc
 import os
 from fpdf import FPDF
 import tempfile
 from datetime import datetime
+import time
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
 
-# Lightweight models optimized for deployment
+# Available models from Hugging Face API
 AVAILABLE_MODELS = {
-    "GPT-2 Small": {
-        "model_name": "gpt2",
-        "model_type": "causal",
-        "max_length": 1024,
-        "description": "Fast and efficient for quick generation"
+    "Mistral-7B-Instruct": {
+        "model_name": "mistralai/Mistral-7B-Instruct-v0.1",
+        "description": "High-quality instruction-following model"
     },
-    "DistilGPT-2": {
-        "model_name": "distilgpt2", 
-        "model_type": "causal",
-        "max_length": 1024,
-        "description": "Optimized lightweight model"
+    "Llama-2-7B-Chat": {
+        "model_name": "meta-llama/Llama-2-7b-chat-hf",
+        "description": "Meta's conversational AI model"
     },
-    "FLAN-T5 Small": {
-        "model_name": "google/flan-t5-small",
-        "model_type": "seq2seq",
-        "max_length": 512,
-        "description": "Instruction-tuned model for structured tasks"
+    "CodeLlama-7B-Instruct": {
+        "model_name": "codellama/CodeLlama-7b-Instruct-hf",
+        "description": "Code and instruction optimized model"
     },
-    "T5 Small": {
-        "model_name": "t5-small",
-        "model_type": "seq2seq", 
-        "max_length": 512,
-        "description": "Compact T5 model"
+    "Zephyr-7B-Beta": {
+        "model_name": "HuggingFaceH4/zephyr-7b-beta",
+        "description": "Fine-tuned for helpful responses"
     }
 }
 
@@ -68,11 +57,11 @@ class PDFGenerator:
             for line in lines:
                 if line.strip():
                     # Handle long lines by wrapping
-                    if len(line) > 80:
+                    if len(line) > 90:
                         words = line.split(' ')
                         current_line = ""
                         for word in words:
-                            if len(current_line + word) < 80:
+                            if len(current_line + word + " ") <= 90:
                                 current_line += word + " "
                             else:
                                 if current_line:
@@ -94,161 +83,125 @@ class PDFGenerator:
             print(f"PDF generation error: {str(e)}")
             return None
 
-class ModelManager:
-    """Manages model loading with memory optimization for deployment"""
+class HuggingFaceAPI:
+    """Handle Hugging Face API requests"""
     
-    def __init__(self):
-        self.current_model = None
-        self.current_tokenizer = None
-        self.current_model_name = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv("HUGGINGFACE_API_KEY")
+        self.base_url = "https://api-inference.huggingface.co/models/"
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}" if self.api_key else None
+        }
     
-    def load_model(self, model_name: str, model_info: Dict[str, Any]):
-        """Load model with deployment optimizations"""
-        if self.current_model_name == model_name and self.current_model is not None:
-            return self.current_model, self.current_tokenizer
+    def query_model(self, model_name: str, prompt: str, max_length: int = 512) -> str:
+        """Query Hugging Face model via API"""
+        if not self.api_key:
+            return "Error: Hugging Face API key not found. Please set HUGGINGFACE_API_KEY environment variable."
         
-        self.clear_model()
+        url = f"{self.base_url}{model_name}"
         
-        try:
-            # Load tokenizer
-            self.current_tokenizer = AutoTokenizer.from_pretrained(
-                model_info["model_name"],
-                trust_remote_code=True
-            )
-            
-            if self.current_tokenizer.pad_token is None:
-                self.current_tokenizer.pad_token = self.current_tokenizer.eos_token
-            
-            # Load model with memory optimization
-            if model_info["model_type"] == "causal":
-                self.current_model = AutoModelForCausalLM.from_pretrained(
-                    model_info["model_name"],
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True
-                )
-            else:
-                self.current_model = AutoModelForSeq2SeqLM.from_pretrained(
-                    model_info["model_name"],
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True
-                )
-            
-            self.current_model = self.current_model.to(self.device)
-            self.current_model_name = model_name
-            
-            return self.current_model, self.current_tokenizer
-            
-        except Exception as e:
-            print(f"Model loading error: {str(e)}")
-            return None, None
-    
-    def clear_model(self):
-        """Clear model from memory"""
-        if self.current_model is not None:
-            del self.current_model
-            del self.current_tokenizer
-            self.current_model = None
-            self.current_tokenizer = None
-            self.current_model_name = None
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-    
-    def generate_text(self, prompt: str, model_name: str, max_new_tokens: int = 400):
-        """Generate text with optimized parameters"""
-        model_info = AVAILABLE_MODELS.get(model_name)
-        if not model_info:
-            return "Model not available"
-        
-        model, tokenizer = self.load_model(model_name, model_info)
-        if model is None or tokenizer is None:
-            return f"Could not load model {model_name}"
+        # Prepare payload based on model type
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_length,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "do_sample": True,
+                "return_full_text": False
+            }
+        }
         
         try:
-            inputs = tokenizer.encode(prompt, return_tensors="pt", truncation=True, 
-                                    max_length=model_info["max_length"]//2)
-            inputs = inputs.to(self.device)
-            
-            generation_config = GenerationConfig(
-                max_new_tokens=min(max_new_tokens, model_info["max_length"]//2),
-                temperature=0.8,
-                do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.1,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id
+            response = requests.post(
+                url, 
+                headers=self.headers, 
+                json=payload,
+                timeout=30
             )
             
-            with torch.no_grad():
-                if model_info["model_type"] == "causal":
-                    outputs = model.generate(inputs, generation_config=generation_config)
-                    generated_ids = outputs[0][inputs.shape[1]:]
+            if response.status_code == 503:
+                # Model is loading, wait and retry
+                time.sleep(20)
+                response = requests.post(
+                    url, 
+                    headers=self.headers, 
+                    json=payload,
+                    timeout=30
+                )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            if isinstance(result, list) and len(result) > 0:
+                if "generated_text" in result[0]:
+                    return result[0]["generated_text"]
                 else:
-                    outputs = model.generate(inputs, generation_config=generation_config)
-                    generated_ids = outputs[0]
+                    return str(result[0])
+            else:
+                return str(result)
                 
-                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                return generated_text.strip()
-                
+        except requests.exceptions.Timeout:
+            return "Error: Request timed out. Please try again."
+        except requests.exceptions.RequestException as e:
+            return f"Error: API request failed - {str(e)}"
         except Exception as e:
-            return f"Generation error: {str(e)}"
+            return f"Error: {str(e)}"
 
 class ResumeBuilderApp:
     def __init__(self):
-        self.model_manager = ModelManager()
+        self.hf_api = HuggingFaceAPI()
         self.pdf_generator = PDFGenerator()
         
     def build_resume_prompt(self, name, education, experience, skills, job_category, language, target_role=None):
         """Build optimized resume prompt"""
-        target_section = f"Target Role: {target_role}\n" if target_role else ""
+        target_section = f"\nTarget Role: {target_role}" if target_role else ""
         
-        return f"""Create a professional resume in {language}:
+        return f"""Create a professional {language} resume for the following person:
 
 Name: {name}
 Education: {education}
 Experience: {experience}
 Skills: {skills}
-Job Category: {job_category}
-{target_section}
+Job Category: {job_category}{target_section}
 
-Generate a well-structured resume with:
-- Professional header
-- Summary (2-3 sentences)
-- Skills section
-- Experience with achievements
-- Education section
+Please generate a well-structured resume with the following sections:
+1. Professional Summary (2-3 sentences)
+2. Skills
+3. Work Experience (with achievements)
+4. Education
 
-Resume:
-"""
+Make it professional and tailored to the job category. Format it clearly with proper sections.
+
+Resume:"""
 
     def build_cover_letter_prompt(self, name, education, experience, skills, job_category, language, company_name=None):
         """Build optimized cover letter prompt"""
-        company_section = f"Company: {company_name}\n" if company_name else ""
+        company_section = f"\nCompany: {company_name}" if company_name else ""
         
-        return f"""Write a professional cover letter in {language}:
+        return f"""Write a professional {language} cover letter for:
 
 Name: {name}
 Education: {education}
 Experience: {experience}
 Skills: {skills}
-Job Category: {job_category}
-{company_section}
+Job Category: {job_category}{company_section}
 
-Create a compelling cover letter with professional opening, relevant experience, and strong closing.
+Create a compelling cover letter with:
+1. Professional opening paragraph
+2. Body highlighting relevant experience and skills
+3. Strong closing paragraph
 
-Cover Letter:
-"""
+Make it engaging and tailored to the job category.
+
+Cover Letter:"""
 
     def generate_resume(self, name, education, experience, skills, job_category, 
                        language, model_name, target_role, progress=gr.Progress()):
         """Generate resume"""
         
-        if not all([name, education, experience, skills, job_category]):
-            return "Please fill in all required fields", None, None
+        if not all([name.strip(), education.strip(), experience.strip(), skills.strip(), job_category.strip()]):
+            return "❌ Please fill in all required fields", None
         
         progress(0.2, desc="Building prompt...")
         
@@ -256,31 +209,40 @@ Cover Letter:
             name, education, experience, skills, job_category, language, target_role
         )
         
-        progress(0.5, desc="Generating resume...")
+        progress(0.5, desc="Generating resume with AI...")
         
-        result = self.model_manager.generate_text(prompt, model_name, max_new_tokens=500)
+        model_info = AVAILABLE_MODELS.get(model_name, AVAILABLE_MODELS["Zephyr-7B-Beta"])
+        result = self.hf_api.query_model(model_info["model_name"], prompt, max_length=600)
         
-        if result.startswith("Error") or result.startswith("Could not") or result.startswith("Model not"):
+        if result.startswith("Error"):
             progress(1.0, desc="Error occurred")
-            return f"❌ {result}", None, None
+            return f"❌ {result}", None
         
         progress(0.8, desc="Creating PDF...")
         
+        # Clean up the result
+        clean_result = result.strip()
+        if not clean_result:
+            return "❌ Generated content is empty. Please try again.", None
+        
         # Generate PDF
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pdf_filename = f"resume_{name.replace(' ', '_')}_{timestamp}.pdf"
-        pdf_path = self.pdf_generator.create_pdf(result, f"Resume - {name}", pdf_filename)
+        pdf_filename = f"resume_{name.replace(' ', '_').replace('/', '_')}_{timestamp}.pdf"
+        pdf_path = self.pdf_generator.create_pdf(clean_result, f"Resume - {name}", pdf_filename)
         
         progress(1.0, desc="Complete!")
         
-        return f"✅ **Resume Generated Successfully**\n\n{result}", pdf_path, pdf_path
+        if pdf_path:
+            return f"✅ **Resume Generated Successfully**\n\n{clean_result}", pdf_path
+        else:
+            return f"✅ **Resume Generated Successfully** (PDF creation failed)\n\n{clean_result}", None
 
     def generate_cover_letter(self, name, education, experience, skills, job_category,
                              language, model_name, company_name, progress=gr.Progress()):
         """Generate cover letter"""
         
-        if not all([name, education, experience, skills, job_category]):
-            return "Please fill in all required fields", None, None
+        if not all([name.strip(), education.strip(), experience.strip(), skills.strip(), job_category.strip()]):
+            return "❌ Please fill in all required fields", None
         
         progress(0.2, desc="Building prompt...")
         
@@ -288,27 +250,36 @@ Cover Letter:
             name, education, experience, skills, job_category, language, company_name
         )
         
-        progress(0.5, desc="Generating cover letter...")
+        progress(0.5, desc="Generating cover letter with AI...")
         
-        result = self.model_manager.generate_text(prompt, model_name, max_new_tokens=400)
+        model_info = AVAILABLE_MODELS.get(model_name, AVAILABLE_MODELS["Zephyr-7B-Beta"])
+        result = self.hf_api.query_model(model_info["model_name"], prompt, max_length=500)
         
-        if result.startswith("Error") or result.startswith("Could not") or result.startswith("Model not"):
+        if result.startswith("Error"):
             progress(1.0, desc="Error occurred")
-            return f"❌ {result}", None, None
+            return f"❌ {result}", None
         
         progress(0.8, desc="Creating PDF...")
         
+        # Clean up the result
+        clean_result = result.strip()
+        if not clean_result:
+            return "❌ Generated content is empty. Please try again.", None
+        
         # Generate PDF
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pdf_filename = f"cover_letter_{name.replace(' ', '_')}_{timestamp}.pdf"
-        pdf_path = self.pdf_generator.create_pdf(result, f"Cover Letter - {name}", pdf_filename)
+        pdf_filename = f"cover_letter_{name.replace(' ', '_').replace('/', '_')}_{timestamp}.pdf"
+        pdf_path = self.pdf_generator.create_pdf(clean_result, f"Cover Letter - {name}", pdf_filename)
         
         progress(1.0, desc="Complete!")
         
-        return f"✅ **Cover Letter Generated Successfully**\n\n{result}", pdf_path, pdf_path
+        if pdf_path:
+            return f"✅ **Cover Letter Generated Successfully**\n\n{clean_result}", pdf_path
+        else:
+            return f"✅ **Cover Letter Generated Successfully** (PDF creation failed)\n\n{clean_result}", None
 
     def create_interface(self):
-        """Create Gradio interface optimized for deployment"""
+        """Create Gradio interface"""
         
         custom_css = """
         .main-header {
@@ -328,25 +299,57 @@ Cover Letter:
             font-weight: bold;
             margin: 1rem 0;
         }
+        .info-box {
+            background: #f0f8ff;
+            border: 1px solid #cce7ff;
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
         """
         
-        with gr.Blocks(css=custom_css, title="AI Resume & Cover Letter Builder") as interface:
+        with gr.Blocks(css=custom_css, title="AI Resume & Cover Letter Builder", theme=gr.themes.Soft()) as interface:
             
             gr.HTML("""
             <div class="main-header">
                 <h1>🚀 AI Resume & Cover Letter Builder</h1>
-                <p>Create professional resumes and cover letters with AI assistance</p>
+                <p>Create professional resumes and cover letters with advanced AI models</p>
+            </div>
+            """)
+            
+            # API Key info
+            gr.HTML("""
+            <div class="info-box">
+                <strong>📝 Setup Required:</strong> Set your Hugging Face API key as environment variable 
+                <code>HUGGINGFACE_API_KEY</code> to use this application.
+                <br>Get your free API key at: <a href="https://huggingface.co/settings/tokens" target="_blank">huggingface.co/settings/tokens</a>
             </div>
             """)
             
             with gr.Row():
                 with gr.Column():
-                    gr.HTML('<div class="section-header">🤖 Model Selection</div>')
+                    gr.HTML('<div class="section-header">🤖 AI Model Selection</div>')
                     model_dropdown = gr.Dropdown(
                         choices=list(AVAILABLE_MODELS.keys()),
-                        value="DistilGPT-2",
+                        value="Zephyr-7B-Beta",
                         label="AI Model",
-                        info="Select model for document generation"
+                        info="Select the AI model for document generation"
+                    )
+                    
+                    # Display model info
+                    def update_model_info(model_name):
+                        return AVAILABLE_MODELS[model_name]["description"]
+                    
+                    model_info = gr.Textbox(
+                        label="Model Description",
+                        value=AVAILABLE_MODELS["Zephyr-7B-Beta"]["description"],
+                        interactive=False
+                    )
+                    
+                    model_dropdown.change(
+                        fn=update_model_info,
+                        inputs=[model_dropdown],
+                        outputs=[model_info]
                     )
             
             with gr.Row():
@@ -355,11 +358,12 @@ Cover Letter:
                     
                     name_input = gr.Textbox(
                         label="Full Name *",
-                        placeholder="Enter your full name"
+                        placeholder="Enter your full name",
+                        max_lines=1
                     )
                     
                     language_input = gr.Dropdown(
-                        choices=["English", "Spanish", "French", "German"],
+                        choices=["English", "Spanish", "French", "German", "Italian", "Portuguese"],
                         value="English",
                         label="Language"
                     )
@@ -370,66 +374,82 @@ Cover Letter:
                     
                     education_input = gr.Textbox(
                         label="Education *",
-                        placeholder="Your educational background",
+                        placeholder="e.g., Bachelor's in Computer Science, XYZ University, 2020",
                         lines=2
                     )
                     
                     experience_input = gr.Textbox(
                         label="Work Experience *",
-                        placeholder="Your work experience and achievements",
-                        lines=3
+                        placeholder="e.g., 3 years as Software Developer at ABC Corp, led team of 5 developers...",
+                        lines=4
                     )
                     
                     skills_input = gr.Textbox(
                         label="Skills *",
-                        placeholder="Your technical and professional skills",
+                        placeholder="e.g., Python, JavaScript, Project Management, Communication",
                         lines=2
                     )
                     
                     job_category_input = gr.Textbox(
-                        label="Job Category *",
-                        placeholder="Target job field or industry"
+                        label="Job Category/Industry *",
+                        placeholder="e.g., Software Development, Marketing, Healthcare",
+                        max_lines=1
                     )
             
-            with gr.Accordion("Additional Options", open=False):
+            with gr.Accordion("🎯 Additional Options", open=False):
                 target_role_input = gr.Textbox(
-                    label="Target Role",
-                    placeholder="Specific position you're targeting"
+                    label="Target Role (Optional)",
+                    placeholder="e.g., Senior Software Engineer, Marketing Manager"
                 )
                 
                 company_name_input = gr.Textbox(
                     label="Company Name (for Cover Letter)",
-                    placeholder="Target company name"
+                    placeholder="e.g., Google, Microsoft, Local Hospital"
                 )
             
             with gr.Row():
                 with gr.Column():
-                    gr.HTML('<div class="section-header">📄 Resume</div>')
-                    resume_btn = gr.Button("Generate Resume", variant="primary", size="lg")
-                    resume_output = gr.Textbox(label="Generated Resume", lines=15, show_copy_button=True)
-                    resume_download = gr.File(label="Download Resume PDF", visible=False)
+                    gr.HTML('<div class="section-header">📄 Resume Generator</div>')
+                    resume_btn = gr.Button("🔥 Generate Resume", variant="primary", size="lg")
+                    resume_output = gr.Textbox(
+                        label="Generated Resume", 
+                        lines=15, 
+                        show_copy_button=True,
+                        placeholder="Your generated resume will appear here..."
+                    )
+                    resume_download = gr.File(label="📥 Download Resume PDF")
                     
                 with gr.Column():
-                    gr.HTML('<div class="section-header">📧 Cover Letter</div>')
-                    cover_letter_btn = gr.Button("Generate Cover Letter", variant="primary", size="lg")
-                    cover_letter_output = gr.Textbox(label="Generated Cover Letter", lines=15, show_copy_button=True)
-                    cover_letter_download = gr.File(label="Download Cover Letter PDF", visible=False)
+                    gr.HTML('<div class="section-header">📧 Cover Letter Generator</div>')
+                    cover_letter_btn = gr.Button("✉️ Generate Cover Letter", variant="primary", size="lg")
+                    cover_letter_output = gr.Textbox(
+                        label="Generated Cover Letter", 
+                        lines=15, 
+                        show_copy_button=True,
+                        placeholder="Your generated cover letter will appear here..."
+                    )
+                    cover_letter_download = gr.File(label="📥 Download Cover Letter PDF")
             
-            # Examples
+            # Examples section
+            gr.HTML('<div class="section-header">💡 Example</div>')
             gr.Examples(
                 examples=[
                     [
-                        "Alex Johnson", "Bachelor's in Marketing, State University, 2020",
-                        "3 years as Marketing Coordinator at TechCorp, managed social media campaigns",
-                        "Digital Marketing, SEO, Content Creation, Analytics",
-                        "Marketing", "English", "DistilGPT-2", "Marketing Manager"
+                        "Sarah Johnson", 
+                        "Bachelor's in Marketing, State University, 2020; Google Analytics Certified", 
+                        "3 years as Digital Marketing Specialist at TechCorp. Managed social media campaigns reaching 100K+ users, increased engagement by 45%, led content strategy for product launches",
+                        "Digital Marketing, SEO/SEM, Content Creation, Google Analytics, Social Media Management, Project Management, Adobe Creative Suite",
+                        "Digital Marketing", 
+                        "English", 
+                        "Zephyr-7B-Beta", 
+                        "Senior Marketing Manager"
                     ]
                 ],
                 inputs=[
                     name_input, education_input, experience_input, skills_input,
                     job_category_input, language_input, model_dropdown, target_role_input
                 ],
-                label="Example Profile"
+                label="Click to load example data"
             )
             
             # Event handlers
@@ -439,7 +459,7 @@ Cover Letter:
                     name_input, education_input, experience_input, skills_input,
                     job_category_input, language_input, model_dropdown, target_role_input
                 ],
-                outputs=[resume_output, resume_download, gr.File(visible=True)],
+                outputs=[resume_output, resume_download],
                 show_progress=True
             )
             
@@ -449,35 +469,24 @@ Cover Letter:
                     name_input, education_input, experience_input, skills_input,
                     job_category_input, language_input, model_dropdown, company_name_input
                 ],
-                outputs=[cover_letter_output, cover_letter_download, gr.File(visible=True)],
+                outputs=[cover_letter_output, cover_letter_download],
                 show_progress=True
             )
         
         return interface
 
 def main():
-    """Main function for deployment"""
+    """Main function"""
     app = ResumeBuilderApp()
     interface = app.create_interface()
     
-    # Launch configuration for different platforms
+    # Launch configuration
     launch_kwargs = {
         "show_error": True,
-        "quiet": True,
+        "share": False,
+        "server_name": "0.0.0.0",
+        "server_port": 7860 if os.getenv("SPACE_ID") else None
     }
-    
-    # Detect deployment environment
-    if os.getenv("SPACE_ID"):  # Hugging Face Spaces
-        launch_kwargs.update({
-            "server_name": "0.0.0.0",
-            "server_port": 7860,
-            "share": False
-        })
-    else:  # Local or Colab
-        launch_kwargs.update({
-            "share": True,
-            "debug": False
-        })
     
     interface.launch(**launch_kwargs)
 
